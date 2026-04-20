@@ -1,0 +1,6 @@
+streamlit
+pandas
+plotly
+watchdog==6.0.0
+openpyxl
+numpy
