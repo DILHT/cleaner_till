@@ -1,3 +1,4 @@
+
 """
 branch_analysis.py  —  Branch Supervision Data Analysis Tool
 =============================================================
@@ -62,8 +63,17 @@ def _member(det):
         if m: return m.group(1).strip().title()
     return ""
 def _cheque(det):
-    m=re.search(r"CHEQUE\s*(?:NO\.?|NUMBER)?\s*(\d{3,6})",str(det).upper())
+    # Cheque numbers appear in three narration styles across branches:
+    #   'CHEQUE 2095' / 'CHEQUE NO 2095' / 'CHEQUE NUMBER 3837'  and the bare
+    #   'CASH FROM BANK 3585' (no word 'cheque'). Capture all three.
+    u=str(det).upper()
+    m=re.search(r"(?:CHEQUE|CHQ)\s*(?:NO\.?|NUMBER)?\s*0*(\d{3,6})",u)
+    if m: return m.group(1)
+    m=re.search(r"FROM\s+BANK\s+0*(\d{3,6})\b",u)
     return m.group(1) if m else ""
+def _teller_no(det):
+    # 'Cash From TELLER 4 - ...' -> '4'. Blank for aggregate 'Cash To Tellers'.
+    m=re.search(r"TELLER\s*0*(\d+)",str(det),re.IGNORECASE); return m.group(1) if m else ""
 def _batch(det):
     m=re.search(r"batch\s*-\s*(\d+)",str(det),re.IGNORECASE)
     return m.group(1) if m else ""
@@ -71,6 +81,39 @@ def _voucher(det):
     m=re.search(r"Vno\.?\s*(\d{10,})",str(det),re.IGNORECASE)
     if not m: m=re.search(r"batch\s*-\s*(\d{10,})",str(det),re.IGNORECASE)
     return m.group(1) if m else ""
+def _officer(ref):
+    # REFERENCE looks like '031125081158ELIKU5334240198' -> the 4-6 letters
+    # in the middle are the posting officer/teller code. This is our "who" signal.
+    m=re.search(r"[A-Z]{4,6}",str(ref)); return m.group() if m else ""
+def _balnum(b):
+    # '3,000,000.00 DR' -> signed float (DR positive for a cash/asset account,
+    # CR negative). Used for the running-balance integrity check.
+    s=str(b).strip(); m=re.match(r"([\d,]+\.?\d*)\s*(DR|CR)?",s,re.I)
+    if not m: return np.nan
+    val=float(m.group(1).replace(",",""))
+    return -val if (m.group(2) or "").upper()=="CR" else val
+def _safe_cell(v):
+    # SECURITY: stop Excel/CSV formula injection. Bank text beginning with
+    # = + - @ would execute as a formula when opened. Force it to plain text.
+    if isinstance(v,str) and v[:1] in ("=","+","-","@","\t","\r"): return "'"+v
+    return v
+def _ctrl_from_footer(fb,fn):
+    # Crystal prints a footer: 'Closing Balance ... Total Debits : N ... Total
+    # Credits : M ... End of Report'. We read it RAW (no header) and pull the two
+    # numbers so we can later prove our parsed totals tie out to the statement.
+    try:
+        eng="xlrd" if fn.lower().endswith(".xls") else "openpyxl"
+        raw=pd.read_excel(io.BytesIO(fb),engine=eng,header=None,dtype=str)
+        for _,r in raw.iterrows():
+            line=" ".join(str(x) for x in r.tolist() if pd.notna(x))
+            if "total debits" in line.lower():
+                d=re.search(r"total debits\s*:?\s*([\d,]+\.?\d*)",line,re.I)
+                c=re.search(r"total credits\s*:?\s*([\d,]+\.?\d*)",line,re.I)
+                return (float(d.group(1).replace(",","")) if d else np.nan,
+                        float(c.group(1).replace(",","")) if c else np.nan)
+    except Exception:
+        pass
+    return (np.nan,np.nan)
 
 # ── cleaners ───────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
@@ -79,8 +122,13 @@ def clean_till(fb,fn,label):
     df=pd.read_excel(io.BytesIO(fb),engine=eng)
     df.columns=[str(c).strip().upper() for c in df.columns]
     if "DETAILS" in df.columns:
-        df=df[~df["DETAILS"].astype(str).str.upper().str.contains("OPENING BALANCE",na=False)].copy()
+        bad=df["DETAILS"].astype(str).str.upper()
+        df=df[~bad.str.contains("OPENING BALANCE",na=False)
+              &~bad.str.contains("CLOSING BALANCE",na=False)
+              &~bad.str.contains("END OF REPORT",na=False)
+              &~bad.str.contains("TOTAL DEBITS",na=False)].copy()
     df["DATE"]=_date(df.get("DATE",pd.Series(dtype=str)))
+    df=df[df["DATE"].notna()].copy()           # drop any non-transaction junk rows
     df["TIME_RAW"]=df.get("TIME",pd.Series(dtype=str)).astype(str)
     df["HOUR"]=df["TIME_RAW"].str.extract(r"^(\d{2}):",expand=False).astype(float)
     df["DEBIT"]=_num(df.get("DEBIT",pd.Series(0,index=df.index)))
@@ -103,9 +151,14 @@ def clean_till(fb,fn,label):
     df["DATE_FMT"]=df["DATE"].apply(_fmt)
     df["WEEKDAY"]=df["DATE"].dt.day_name()
     df["IS_WEEKEND"]=df["WEEKDAY"].isin(["Saturday","Sunday"])
-    df["AFTER_HOURS"]=df["HOUR"].notna()&((df["HOUR"]<8)|(df["HOUR"]>=17))
+    # after-hours tightened: only genuinely odd times (before 07:00 or from 19:00)
+    # so normal opening/closing entries don't drown the real anomalies.
+    df["AFTER_HOURS"]=df["HOUR"].notna()&((df["HOUR"]<7)|(df["HOUR"]>=19))
     df["TIME_DISPLAY"]=df["TIME_RAW"].str[:8]
+    df["OFFICER"]=df.get("REFERENCE",pd.Series("",index=df.index)).apply(_officer)
     df["BALANCE_DISPLAY"]=df.get("BALANCE",pd.Series("",index=df.index)).astype(str)
+    df["BALANCE_NUM"]=df["BALANCE_DISPLAY"].apply(_balnum)
+    df.attrs["ctrl_deb"],df.attrs["ctrl_cre"]=_ctrl_from_footer(fb,fn)
     return df
 
 @st.cache_data(show_spinner=False)
@@ -114,8 +167,10 @@ def clean_treasury(fb,fn):
     df=pd.read_excel(io.BytesIO(fb),engine=eng)
     df.columns=[str(c).strip().upper() for c in df.columns]
     df=df[~df.get("DETAILS",pd.Series("",index=df.index)).astype(str).str.upper()
-           .str.contains("OPENING BALANCE",na=False)].copy()
+           .str.contains("OPENING BALANCE|CLOSING BALANCE|END OF REPORT|TOTAL DEBITS",
+                         na=False,regex=True)].copy()
     df["DATE"]=_date(df.get("DATE",pd.Series(dtype=str)))
+    df=df[df["DATE"].notna()].copy()
     df["DATE_FMT"]=df["DATE"].apply(_fmt)
     df["TIME_DISPLAY"]=df.get("TIME",pd.Series("",index=df.index)).astype(str).str[:8]
     df["DEBIT"]=_num(df.get("DEBIT",pd.Series(0,index=df.index)))
@@ -145,8 +200,12 @@ def clean_treasury(fb,fn):
         d=re.sub(r"^Journal\s*\(","",d,flags=re.IGNORECASE).rstrip(")").strip()
         return d.strip()
     df["ACTIVITY"]=det.apply(_act)
+    df["TELLER_NO"]=det.apply(_teller_no)
+    df["OFFICER"]=df.get("REFERENCE",pd.Series("",index=df.index)).apply(_officer)
     df["BALANCE"]=df.get("BALANCE",pd.Series("",index=df.index)).astype(str)
+    df["BALANCE_NUM"]=df["BALANCE"].apply(_balnum)
     df["REFERENCE"]=df.get("REFERENCE",pd.Series("",index=df.index)).astype(str)
+    df.attrs["ctrl_deb"],df.attrs["ctrl_cre"]=_ctrl_from_footer(fb,fn)
     return df
 
 @st.cache_data(show_spinner=False)
@@ -222,8 +281,10 @@ def clean_petty(fb,fn):
     df=pd.read_excel(io.BytesIO(fb),engine=eng)
     df.columns=[str(c).strip().upper() for c in df.columns]
     df=df[~df.get("DETAILS",pd.Series("",index=df.index)).astype(str).str.upper()
-           .str.contains("OPENING BALANCE",na=False)].copy()
+           .str.contains("OPENING BALANCE|CLOSING BALANCE|END OF REPORT|TOTAL DEBITS",
+                         na=False,regex=True)].copy()
     df["DATE"]=_date(df.get("DATE",pd.Series(dtype=str)))
+    df=df[df["DATE"].notna()].copy()
     df["DATE_FMT"]=df["DATE"].apply(_fmt)
     df["TIME_DISPLAY"]=df.get("TIME",pd.Series("",index=df.index)).astype(str).str[:8]
     df["DEBIT"]=_num(df.get("DEBIT",pd.Series(0,index=df.index)))
@@ -250,254 +311,456 @@ def clean_petty(fb,fn):
         return d.strip()
     df["ACTIVITY"]=det.apply(_act)
     df["BATCH_NO"]=det.apply(_batch)
+    df["OFFICER"]=df.get("REFERENCE",pd.Series("",index=df.index)).apply(_officer)
     df["BALANCE"]=df.get("BALANCE",pd.Series("",index=df.index)).astype(str)
+    df["BALANCE_NUM"]=df["BALANCE"].apply(_balnum)
+    # ---- real-logic flagging (replaces the old flat 'every payment >= 20k') ----
+    # A flat threshold flagged almost everything and buried the real exceptions.
+    # Instead flag what is genuinely worth a second look:
     df["FLAG"]=""
-    df.loc[df["CREDIT"]>=20000,"FLAG"]="Large payment ≥ MWK 20,000 — verify receipt and voucher"
+    spend=df[df["CREDIT"]>0]["CREDIT"]
+    # 1) statistical outlier: spend far above this branch's own norm
+    #    (> 75th percentile + 1.5*IQR), so the threshold adapts per branch.
+    if len(spend)>=4:
+        q1,q3=spend.quantile(0.25),spend.quantile(0.75); hi=q3+3.0*(q3-q1)
+        df.loc[(df["CREDIT"]>0)&(df["CREDIT"]>hi),"FLAG"]=(
+            "Unusually large vs branch norm - verify voucher & approval")
+    # 2) reversals: always worth confirming the original + reversal pair
+    df.loc[df["CATEGORY"]=="REVERSAL","FLAG"]="Reversal - confirm original entry and reason"
+    # 3) duplicate: same activity + amount + date (possible double payment)
     dup=df.duplicated(subset=["DATE","CREDIT","ACTIVITY"],keep=False)&(df["CREDIT"]>0)
-    df.loc[dup&(df["FLAG"]==""),"FLAG"]="Duplicate: same activity + amount + date"
+    df.loc[dup&(df["FLAG"]==""),"FLAG"]="Possible duplicate - same activity, amount & date"
+    # 4) spend with no batch reference (weak audit trail)
+    df.loc[(df["CREDIT"]>0)&(df["BATCH_NO"]=="")&(df["FLAG"]==""),"FLAG"]=(
+        "Spend with no batch reference - check supporting document")
+    df.attrs["ctrl_deb"],df.attrs["ctrl_cre"]=_ctrl_from_footer(fb,fn)
     return df
 
-# ── excel builder ──────────────────────────────────────────────────────────────
-NAVY="FF1A3A5C";GREEN="FF1E7E3E";AMBER="FFB45309";BLUE="FF185FA5"
-RED="FFA32D2D";TEAL="FF0F6E56";PURPLE="FF534AB7";WHITE="FFFFFFFF";ALT="FFEEF4FB"
+# ── excel output engine (rewritten for clarity + real-logic flagging) ───────────
+# Design goals:
+#   * findings first  - sheet 00 lists every real exception, ranked by severity,
+#     with where to look and what to do, so the analyst focuses on anomalies.
+#   * numbers are numbers - all money is numeric with accounting format, so every
+#     column sums, sorts and pivots. Text balances are kept only for reference.
+#   * proof of completeness - each module ties its parsed totals to the statement
+#     footer (Total Debits / Total Credits) and runs a running-balance check.
+#   * security - every string cell is guarded against Excel formula injection.
+from collections import Counter
 
-def _fmt_sheet(ws,hdr=NAVY):
-    thin=Side(style="thin",color="FFD0D0D0"); bdr=Border(left=thin,right=thin,top=thin,bottom=thin)
-    alt=PatternFill("solid",fgColor=ALT)
-    for cell in ws[1]:
-        cell.fill=PatternFill("solid",fgColor=hdr); cell.font=Font(bold=True,color=WHITE,size=9,name="Arial")
-        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True); cell.border=bdr
-    ws.row_dimensions[1].height=26; ws.freeze_panes="A2"
-    for r,row in enumerate(ws.iter_rows(min_row=2),2):
-        for cell in row:
-            cell.border=bdr; cell.font=Font(size=9,name="Arial")
-            if r%2==0:
-                c=(cell.fill.fgColor.rgb if cell.fill and cell.fill.fgColor else "00000000")
-                if c in ("FFFFFFFF","FF000000","00000000"): cell.fill=alt
-    for col in ws.columns:
-        ml=max((len(str(c.value or "")) for c in col),default=8)
-        ws.column_dimensions[col[0].column_letter].width=min(max(ml+2,10),40)
+NAVY="FF1A3A5C"; GREEN="FF1E7E3E"; AMBER="FFB45309"; BLUE="FF185FA5"
+RED="FFB91C1C"; TEAL="FF0F6E56"; PURPLE="FF534AB7"; WHITE="FFFFFFFF"; ALT="FFEFF4FB"
+SEV_FILL={"CRITICAL":"FFF6D4D4","HIGH":"FFFBE2C7","MEDIUM":"FFFBF1C7",
+          "LOW":"FFE4EDF8","INFO":"FFE4EDF8"}
+SEV_RANK={"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
+MONEYFMT='#,##0.00;(#,##0.00);-'; INTFMT='#,##0'
+# columns rendered as money / integer, detected by header name
+MONEY_HINT=("AMOUNT","DEBIT","CREDIT","BALANCE","TOTAL","SPENT","DRAWN","MWK",
+            "DEPOSITED","RECEIVED","NET","LARGEST","ISSUED","SHORTAGE","OVERAGE")
+INT_COLS={"COUNT","ROWS","ROW_COUNT","TRANSACTIONS","WITHDRAWALS","DEPOSITS",
+          "BATCHES","CHEQUE_NO","LINE_NO","TELLER_NO","APPROVED","DIRECT_RECEIPTS",
+          "BAL_BREAKS","DUPLICATES","DEPOSIT_COUNT","WITHDRAWAL_COUNT"}
 
-def _safe(df):
+def _safe_df(df):
     d=df.copy()
     for col in d.columns:
         if pd.api.types.is_bool_dtype(d[col]): d[col]=d[col].map({True:"Yes",False:"No"})
-        elif d[col].dtype==object: d[col]=d[col].astype(str).replace("nan","")
+        elif d[col].dtype==object:
+            d[col]=d[col].astype(str).replace({"nan":"","NaT":"","None":""}).map(_safe_cell)
     return d
 
+def _money_str(v):
+    if isinstance(v,(int,float)) and not isinstance(v,bool):
+        return f"MWK {v:,.2f}" if v else "MWK 0.00"
+    return str(v)
+
+class Findings:
+    """Collects exceptions raised by the automated checks across all modules."""
+    def __init__(self): self.items=[]
+    def add(self,sev,area,finding,count="",amount="",where="",action=""):
+        self.items.append({"SEVERITY":sev,"AREA":area,"FINDING":finding,"COUNT":count,
+                           "AMOUNT_MWK":amount,"SEE_SHEET":where,"RECOMMENDED_ACTION":action})
+    def df(self):
+        if not self.items:
+            return pd.DataFrame([{"SEVERITY":"INFO","AREA":"-",
+                "FINDING":"No exceptions detected by automated checks","COUNT":"",
+                "AMOUNT_MWK":"","SEE_SHEET":"","RECOMMENDED_ACTION":
+                "Proceed with physical reconciliation"}])
+        d=pd.DataFrame(self.items)
+        d["_r"]=d["SEVERITY"].map(SEV_RANK).fillna(9)
+        return d.sort_values("_r").drop(columns="_r").reset_index(drop=True)
+
+def _bal_breaks(df):
+    """Offset-independent running-balance check: the change in the statement
+    balance between consecutive rows must equal (debit - credit) of that row.
+    Returns (break_count, breaking_rows)."""
+    if "BALANCE_NUM" not in df.columns or df["BALANCE_NUM"].isna().all():
+        return 0, pd.DataFrame()
+    d=df.sort_values("LINE_NO").copy()
+    delta=d["DEBIT"]-d["CREDIT"]
+    step=d["BALANCE_NUM"].diff()
+    mism=step.notna()&((step-delta).abs()>1.0)
+    return int(mism.sum()), d[mism]
+
+def _tie_out(df_or_attrs_list,sum_deb,sum_cre):
+    """Compare parsed totals to the statement footer totals. Accepts a df (uses
+    its .attrs) or a list of dfs (sums their footers). Returns (ok, cd, cc)."""
+    if isinstance(df_or_attrs_list,list):
+        cd=np.nansum([t.attrs.get("ctrl_deb",np.nan) for t in df_or_attrs_list])
+        cc=np.nansum([t.attrs.get("ctrl_cre",np.nan) for t in df_or_attrs_list])
+    else:
+        cd=df_or_attrs_list.attrs.get("ctrl_deb",np.nan)
+        cc=df_or_attrs_list.attrs.get("ctrl_cre",np.nan)
+    if np.isnan(cd) and np.isnan(cc): return None,cd,cc       # no footer found
+    ok=(np.isnan(cd) or abs(sum_deb-cd)<1)and(np.isnan(cc) or abs(sum_cre-cc)<1)
+    return ok,cd,cc
+
+def _cheque_sequence(nums):
+    """Outlier-aware cheque gap analysis. A real cheque book is a dense run, so
+    isolated stragglers (>50 from any neighbour) are flagged as OUTLIER for
+    review rather than inflating the 'missing' list. Returns
+    (unique, duplicates, outliers, (lo,hi), missing)."""
+    counts=Counter(nums); uniq=sorted(counts)
+    dups=sorted(n for n,c in counts.items() if c>1)
+    outliers=[]
+    for i,v in enumerate(uniq):
+        nb=[]
+        if i>0: nb.append(v-uniq[i-1])
+        if i<len(uniq)-1: nb.append(uniq[i+1]-v)
+        if nb and min(nb)>50: outliers.append(v)
+    core=[v for v in uniq if v not in outliers]
+    missing=[]
+    for i in range(len(core)-1):
+        g=core[i+1]-core[i]
+        if 1<g<=50: missing.extend(range(core[i]+1,core[i+1]))
+    return uniq,dups,outliers,((core[0],core[-1]) if core else (None,None)),missing
+
+def _style(ws,hdr_color):
+    """Header styling, freeze, autofilter, borders, money/int formats, and
+    row highlighting driven by a SEVERITY / STATUS / FLAG / FINDING column."""
+    thin=Side(style="thin",color="FFDDDDDD"); bdr=Border(thin,thin,thin,thin)
+    headers=[str(c.value).upper() if c.value is not None else "" for c in ws[1]]
+    for c in ws[1]:
+        c.fill=PatternFill("solid",fgColor=hdr_color)
+        c.font=Font(bold=True,color=WHITE,size=9,name="Arial")
+        c.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True); c.border=bdr
+    ws.row_dimensions[1].height=28; ws.freeze_panes="A2"
+    if ws.max_column>=1:
+        ws.auto_filter.ref=f"A1:{get_column_letter(ws.max_column)}{max(ws.max_row,1)}"
+    sev_i=headers.index("SEVERITY") if "SEVERITY" in headers else -1
+    sta_i=headers.index("STATUS") if "STATUS" in headers else -1
+    flg_i=next((i for i,h in enumerate(headers) if h in ("FLAG","FINDING")),-1)
+    altfill=PatternFill("solid",fgColor=ALT)
+    for ri,row in enumerate(ws.iter_rows(min_row=2),start=2):
+        rowfill=None
+        if sev_i>=0:
+            rowfill=SEV_FILL.get(str(row[sev_i].value).upper())
+        elif sta_i>=0 and "MISSING" in str(row[sta_i].value).upper():
+            rowfill=SEV_FILL["CRITICAL"]
+        elif sta_i>=0 and ("DUPLICATE" in str(row[sta_i].value).upper()
+                           or "OUTLIER" in str(row[sta_i].value).upper()):
+            rowfill=SEV_FILL["HIGH"]
+        elif flg_i>=0 and str(row[flg_i].value).strip():
+            rowfill=SEV_FILL["MEDIUM"]
+        for ci,cell in enumerate(row):
+            cell.border=bdr; cell.font=Font(size=9,name="Arial")
+            h=headers[ci] if ci<len(headers) else ""
+            if isinstance(cell.value,(int,float)) and not isinstance(cell.value,bool):
+                if any(k in h for k in MONEY_HINT): cell.number_format=MONEYFMT
+                elif h in INT_COLS: cell.number_format=INTFMT
+            if rowfill: cell.fill=PatternFill("solid",fgColor=rowfill)
+            elif ri%2==0: cell.fill=altfill
+    for col in ws.columns:
+        ml=max((len(str(c.value or "")) for c in col),default=8)
+        ws.column_dimensions[col[0].column_letter].width=min(max(ml+2,10),50)
+
 def build_excel(branch,tills,treasury,journals,petty):
-    buf=io.BytesIO(); sheets=[]
+    buf=io.BytesIO(); sheets=[]; F=Findings()
     def add(nm,df,col=NAVY):
-        if df is not None and not df.empty: sheets.append((nm[:31],_safe(df),col))
-    def _s(v):
-        if isinstance(v,float): return f"MWK {v:,.2f}" if v>0 else "MWK 0.00"
-        if isinstance(v,int): return f"{v:,}"
-        return str(v)
+        if df is not None and len(df): sheets.append((nm[:31],_safe_df(df),col))
     def _pick(df,cols): return df[[c for c in cols if c in df.columns]]
 
     all_till=pd.concat(tills.values(),ignore_index=True) if tills else pd.DataFrame()
     p0=all_till["DATE"].min() if not all_till.empty and "DATE" in all_till else None
     p1=all_till["DATE"].max() if not all_till.empty and "DATE" in all_till else None
 
-    # SUMMARY
-    rows=[("BRANCH SUPERVISION ANALYSIS REPORT",""),
-          ("Branch",branch or "Not specified"),
-          ("Period",f"{_fmt(p0)} to {_fmt(p1)}" if p0 else "N/A"),
-          ("Generated",datetime.now().strftime("%d/%m/%Y %H:%M")),("","")]
-    if not all_till.empty:
-        wd=all_till[all_till["CATEGORY"]=="WITHDRAWAL"]
-        dp=all_till[all_till["CATEGORY"]=="DEPOSIT"]
-        dr=all_till[all_till["CATEGORY"]=="DIRECT_RECEIPT"]
-        ah=all_till[all_till.get("AFTER_HOURS",pd.Series(False,index=all_till.index))==True] if "AFTER_HOURS" in all_till else pd.DataFrame()
-        wk=all_till[all_till.get("IS_WEEKEND",pd.Series(False,index=all_till.index))==True] if "IS_WEEKEND" in all_till else pd.DataFrame()
-        rows+=[("TILL SUMMARY",""),("Number of tills",_s(len(tills))),
-               ("Total transactions (all tills)",_s(len(all_till))),
-               ("Total cash withdrawals (MWK)",_s(wd["CREDIT"].sum())),
-               ("Withdrawal count",_s(len(wd))),
-               ("Total cash deposits (MWK)",_s(dp["DEBIT"].sum())),
-               ("Total direct receipts — loan payments (MWK)",_s(dr["DEBIT"].sum())),
-               ("After-hours transactions — FINDING",_s(len(ah))),
-               ("Weekend transactions — FINDING",_s(len(wk))),("","")]
-    if treasury is not None and not treasury.empty:
-        cfb=treasury[treasury["CATEGORY"]=="CASH_FROM_BANK"]
-        ctb=treasury[treasury["CATEGORY"]=="CASH_TO_BANK"]
-        ctt=treasury[treasury["CATEGORY"]=="CASH_TO_TELLERS"]
-        rows+=[("TREASURY SUMMARY",""),
-               ("Cash received from bank (MWK)",_s(cfb["DEBIT"].sum())),
-               ("Number of cheque withdrawals",_s(len(cfb))),
-               ("Cash deposited to bank (MWK)",_s(ctb["CREDIT"].sum())),
-               ("Cash issued to tellers (MWK)",_s(ctt["CREDIT"].sum())),("","")]
-    if journals is not None and not journals.empty:
-        sm=int(journals["SAME_MAKER_CHECKER"].sum()); nc=int(journals["NO_CHECKER"].sum())
-        p2=int(journals["PERSON_TO_PERSON"].sum()); sd=int(journals["SAME_PERSON_DR_CR"].sum())
-        rows+=[("JOURNAL SUMMARY",""),
-               ("Total journal batches",_s(journals["BATCH_NO"].nunique())),
-               ("Total journal legs",_s(len(journals))),
-               ("Total debited (MWK)",_s(journals["DEBIT"].sum())),
-               ("Same maker and checker — CRITICAL FINDING",_s(sm)),
-               ("No checker recorded — CRITICAL FINDING",_s(nc)),
-               ("Person-to-person transfers — Investigate",_s(p2)),
-               ("Same person DR and CR — Investigate",_s(sd)),("","")]
-    if petty is not None and not petty.empty:
-        rows+=[("PETTY CASH SUMMARY",""),
-               ("Total petty transactions",_s(len(petty))),
-               ("Total expenditure (MWK)",_s(petty["CREDIT"].sum())),
-               ("Anomaly flags",_s(int((petty["FLAG"]!="").sum())))]
-    add("SUMMARY",pd.DataFrame(rows,columns=["Item","Value"]),NAVY)
-
-    # TILLS
-    WALL=["LINE_NO","DATE_FMT","TIME_DISPLAY","CATEGORY","MEMBER_NAME","VOUCHER_NO",
-          "DEBIT","CREDIT","BALANCE_DISPLAY","REFERENCE","DETAILS"]
-    for tname,tdf in tills.items():
-        lbl=tname.upper().replace(" ","_").replace(".","")
+    # ===== TILLS =====
+    WALL=["LINE_NO","DATE_FMT","TIME_DISPLAY","CATEGORY","MEMBER_NAME","OFFICER",
+          "VOUCHER_NO","DEBIT","CREDIT","BALANCE_NUM","BALANCE_DISPLAY","REFERENCE","DETAILS"]
+    REN={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","BALANCE_NUM":"BALANCE_MWK",
+         "BALANCE_DISPLAY":"BALANCE","CREDIT":"AMOUNT_OUT","DEBIT":"AMOUNT_IN"}
+    for ti,(tname,tdf) in enumerate(tills.items(),start=10):
+        lbl=re.sub(r"[^A-Z0-9]+","_",tname.upper()).strip("_")
         wd=tdf[tdf["CATEGORY"]=="WITHDRAWAL"]; dp=tdf[tdf["CATEGORY"]=="DEPOSIT"]
         dr=tdf[tdf["CATEGORY"]=="DIRECT_RECEIPT"]; cr=tdf[tdf["CATEGORY"]=="CASH_REQUEST"]
-        ah=tdf[tdf.get("AFTER_HOURS",pd.Series(False,index=tdf.index))==True] if "AFTER_HOURS" in tdf else pd.DataFrame()
-        wk=tdf[tdf.get("IS_WEEKEND",pd.Series(False,index=tdf.index))==True] if "IS_WEEKEND" in tdf else pd.DataFrame()
-        ts=[("Till",tname),("Total transactions",_s(len(tdf))),
-            ("Cash withdrawals (MWK)",_s(wd["CREDIT"].sum())),("Withdrawal count",_s(len(wd))),
-            ("Cash deposits received (MWK)",_s(dp["DEBIT"].sum())),("Deposit count",_s(len(dp))),
-            ("Direct receipts — loan payments (MWK)",_s(dr["DEBIT"].sum())),("Direct receipt count",_s(len(dr))),
-            ("Cash requests from CCASHIER (MWK)",_s(cr["DEBIT"].sum())),
-            ("After-hours transactions",_s(len(ah))),("Weekend transactions",_s(len(wk)))]
-        add(f"{lbl}_SUMMARY",pd.DataFrame(ts,columns=["Item","Value"]),GREEN)
+        sd,sc=tdf["DEBIT"].sum(),tdf["CREDIT"].sum()
+        ok,cd,cc=_tie_out(tdf,sd,sc)
+        if ok is False:
+            F.add("HIGH",tname,"Parsed totals do not tie to statement footer",
+                  "", f"DR diff {sd-cd:,.0f} / CR diff {sc-cc:,.0f}",
+                  f"{ti}_{lbl}_SUMMARY","Re-export the statement; a row may be missing or duplicated")
+        nb,nbrows=_bal_breaks(tdf)
+        if nb:
+            F.add("HIGH",tname,"Running balance does not reconcile line to line",
+                  nb,"",f"{ti}_{lbl}_ALL","Inspect the flagged rows - a transaction may be missing or out of order")
 
-        WD_COLS=["LINE_NO","DATE_FMT","TIME_DISPLAY","WEEKDAY","MEMBER_NAME","VOUCHER_NO",
-                 "CREDIT","BALANCE_DISPLAY","AFTER_HOURS","REFERENCE"]
+        ts=[("Till",tname),("Period",f"{_fmt(tdf['DATE'].min())} to {_fmt(tdf['DATE'].max())}"),
+            ("Total transactions",len(tdf)),
+            ("Cash withdrawals (MWK)",wd["CREDIT"].sum()),("Withdrawal count",len(wd)),
+            ("Cash deposits (MWK)",dp["DEBIT"].sum()),("Deposit count",len(dp)),
+            ("Direct receipts - loan repayments (MWK)",dr["DEBIT"].sum()),
+            ("Cash requests from main cashier (MWK)",cr["DEBIT"].sum()),
+            ("Total debits parsed (MWK)",sd),("Total debits per statement (MWK)",cd),
+            ("Total credits parsed (MWK)",sc),("Total credits per statement (MWK)",cc),
+            ("Totals tie to statement?","Yes" if ok else ("No - investigate" if ok is False else "No footer found")),
+            ("Running-balance breaks",nb)]
+        add(f"{ti}_{lbl}_SUMMARY",pd.DataFrame(ts,columns=["Item","Value"]),GREEN)
+
         if not wd.empty:
-            w=_pick(wd.sort_values("DATE"),WD_COLS)
-            w=w.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","CREDIT":"AMOUNT_WITHDRAWN","BALANCE_DISPLAY":"BALANCE"})
-            add(f"{lbl}_WITHDRAWALS",w,GREEN)
-
-        DEP_COLS=["LINE_NO","DATE_FMT","TIME_DISPLAY","MEMBER_NAME","VOUCHER_NO","DEBIT","BALANCE_DISPLAY","REFERENCE"]
+            w=_pick(wd.sort_values("CREDIT",ascending=False),
+                    ["MEMBER_NAME","CREDIT","DATE_FMT","TIME_DISPLAY","OFFICER","VOUCHER_NO",
+                     "BALANCE_NUM","AFTER_HOURS","IS_WEEKEND","REFERENCE"])
+            w=w.rename(columns={"MEMBER_NAME":"NAME","CREDIT":"AMOUNT_WITHDRAWN",
+                                "DATE_FMT":"DATE","TIME_DISPLAY":"TIME","BALANCE_NUM":"BALANCE_MWK"})
+            add(f"{ti}_{lbl}_WITHDRAWALS",w,GREEN)
         if not dp.empty:
-            d=_pick(dp.sort_values("DATE"),DEP_COLS)
-            d=d.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","DEBIT":"AMOUNT_DEPOSITED","BALANCE_DISPLAY":"BALANCE"})
-            add(f"{lbl}_DEPOSITS",d,TEAL)
-
-        DR_COLS=["LINE_NO","DATE_FMT","TIME_DISPLAY","MEMBER_NAME","VOUCHER_NO","DEBIT","BALANCE_DISPLAY","REFERENCE"]
+            d=_pick(dp.sort_values("DEBIT",ascending=False),
+                    ["MEMBER_NAME","DEBIT","DATE_FMT","TIME_DISPLAY","OFFICER","VOUCHER_NO","REFERENCE"])
+            d=d.rename(columns={"MEMBER_NAME":"NAME","DEBIT":"AMOUNT_DEPOSITED",
+                                "DATE_FMT":"DATE","TIME_DISPLAY":"TIME"})
+            add(f"{ti}_{lbl}_DEPOSITS",d,TEAL)
         if not dr.empty:
-            r=_pick(dr.sort_values("DATE"),DR_COLS)
-            r=r.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","DEBIT":"AMOUNT_RECEIVED","BALANCE_DISPLAY":"BALANCE"})
-            add(f"{lbl}_DIRECT_RECEIPTS",r,BLUE)
+            r=_pick(dr.sort_values("DEBIT",ascending=False),
+                    ["MEMBER_NAME","DEBIT","DATE_FMT","TIME_DISPLAY","OFFICER","VOUCHER_NO","REFERENCE"])
+            r=r.rename(columns={"MEMBER_NAME":"NAME","DEBIT":"AMOUNT_RECEIVED",
+                                "DATE_FMT":"DATE","TIME_DISPLAY":"TIME"})
+            add(f"{ti}_{lbl}_DIRECT_RECEIPTS",r,BLUE)
 
-        daily=(tdf.groupby("DATE_FMT",sort=False)
-               .agg(DATE=("DATE","first"),
-                    WITHDRAWALS=("CATEGORY",lambda x:(x=="WITHDRAWAL").sum()),
-                    TOTAL_WITHDRAWN=("CREDIT",lambda x:x[tdf.loc[x.index,"CATEGORY"]=="WITHDRAWAL"].sum()),
-                    DEPOSITS=("CATEGORY",lambda x:(x=="DEPOSIT").sum()),
-                    TOTAL_DEPOSITED=("DEBIT",lambda x:x[tdf.loc[x.index,"CATEGORY"]=="DEPOSIT"].sum()),
-                    DIRECT_RECEIPTS=("CATEGORY",lambda x:(x=="DIRECT_RECEIPT").sum()),
-                    TOTAL_DR=("DEBIT",lambda x:x[tdf.loc[x.index,"CATEGORY"]=="DIRECT_RECEIPT"].sum()))
+        daily=(tdf.groupby("DATE_FMT",sort=False).agg(
+                DATE=("DATE","first"),
+                WITHDRAWALS=("CATEGORY",lambda x:(x=="WITHDRAWAL").sum()),
+                TOTAL_WITHDRAWN=("CREDIT",lambda x:x[tdf.loc[x.index,"CATEGORY"]=="WITHDRAWAL"].sum()),
+                DEPOSITS=("CATEGORY",lambda x:(x=="DEPOSIT").sum()),
+                TOTAL_DEPOSITED=("DEBIT",lambda x:x[tdf.loc[x.index,"CATEGORY"]=="DEPOSIT"].sum()))
                .reset_index(drop=True).sort_values("DATE"))
         daily["DATE"]=daily["DATE"].apply(_fmt)
-        add(f"{lbl}_DAILY_SUMMARY",daily,NAVY)
+        add(f"{ti}_{lbl}_DAILY",daily,NAVY)
 
-        if "MEMBER_NAME" in wd.columns and not wd.empty:
+        if not wd.empty:
             ms=(wd[wd["MEMBER_NAME"]!=""].groupby("MEMBER_NAME")
-                .agg(WITHDRAWALS=("CREDIT","count"),TOTAL_WITHDRAWN=("CREDIT","sum"),LARGEST_SINGLE=("CREDIT","max"))
-                .reset_index().sort_values("TOTAL_WITHDRAWN",ascending=False))
-            add(f"{lbl}_MEMBER_SUMMARY",ms,PURPLE)
+                .agg(WITHDRAWALS=("CREDIT","count"),TOTAL_WITHDRAWN=("CREDIT","sum"),
+                     LARGEST_SINGLE=("CREDIT","max")).reset_index()
+                .sort_values("TOTAL_WITHDRAWN",ascending=False)
+                .rename(columns={"MEMBER_NAME":"NAME"}))
+            add(f"{ti}_{lbl}_MEMBERS",ms,PURPLE)
 
-        all_out=_pick(tdf.sort_values("DATE"),WALL)
-        all_out=all_out.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","BALANCE_DISPLAY":"BALANCE"})
-        add(f"{lbl}_ALL_TRANSACTIONS",all_out,NAVY)
+        allt=_pick(tdf.sort_values("LINE_NO"),WALL).rename(columns=REN)
+        add(f"{ti}_{lbl}_ALL",allt,NAVY)
 
-        anoms=[]
+        # ---- real-logic anomalies for this till ----
+        an=[]
+        # duplicate payout: same member + amount + date (possible double pay)
+        dm=wd.duplicated(subset=["DATE_FMT","MEMBER_NAME","CREDIT"],keep=False)&(wd["MEMBER_NAME"]!="")&(wd["CREDIT"]>0)
+        if dm.any():
+            a=_pick(wd[dm],["LINE_NO","DATE_FMT","TIME_DISPLAY","MEMBER_NAME","CREDIT","OFFICER"]).copy()
+            a["FLAG"]="Duplicate: same member, amount & date"; an.append(a)
+            F.add("HIGH",tname,"Possible duplicate withdrawals (same member, amount, date)",
+                  int(dm.sum()),wd[dm]["CREDIT"].sum(),f"{ti}_{lbl}_FLAGS","Confirm each against the physical voucher; rule out double payment")
+        # cash withdrawal with no member name (weak audit trail)
+        nn=wd[wd["MEMBER_NAME"]==""]
+        if not nn.empty:
+            a=_pick(nn,["LINE_NO","DATE_FMT","TIME_DISPLAY","CREDIT","OFFICER"]).copy()
+            a["FLAG"]="Withdrawal with no member name captured"; an.append(a)
+            F.add("MEDIUM",tname,"Withdrawals with no member name",
+                  len(nn),nn["CREDIT"].sum(),f"{ti}_{lbl}_FLAGS","Confirm payee identity on the slip")
+        # statistical large-value outlier (adapts to this till's own distribution)
+        # genuinely extreme value: top 1% for this till (a short, actionable list,
+        # not the whole legitimate loan-disbursement cluster an IQR rule would catch)
+        wv=wd["CREDIT"]
+        if len(wv)>=20:
+            thr=wv.quantile(0.99)
+            big=wd[wd["CREDIT"]>thr]
+            if not big.empty:
+                a=_pick(big,["LINE_NO","DATE_FMT","MEMBER_NAME","CREDIT","OFFICER"]).copy()
+                a["FLAG"]=f"Top 1% largest (> MWK {thr:,.0f})"; an.append(a)
+                F.add("MEDIUM",tname,"Largest-value withdrawals (top 1%) - verify authorisation",
+                      len(big),big["CREDIT"].sum(),f"{ti}_{lbl}_FLAGS","Confirm dual authorisation / limits were observed")
+        # after-hours (low) - kept as information, not noise
+        ah=tdf[tdf.get("AFTER_HOURS",False)==True]
         if not ah.empty:
             a=_pick(ah,["LINE_NO","DATE_FMT","TIME_DISPLAY","CATEGORY","MEMBER_NAME","CREDIT","DEBIT"]).copy()
-            a["FLAG"]="After-hours transaction"; a=a.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME"}); anoms.append(a)
-        if not wk.empty:
-            a=_pick(wk,["LINE_NO","DATE_FMT","WEEKDAY","CATEGORY","MEMBER_NAME","CREDIT","DEBIT"]).copy()
-            a["FLAG"]="Weekend transaction"; a=a.rename(columns={"DATE_FMT":"DATE"}); anoms.append(a)
-        lrg=wd[wd["CREDIT"]>=1_000_000]
-        if not lrg.empty:
-            a=_pick(lrg,["LINE_NO","DATE_FMT","MEMBER_NAME","CREDIT"]).copy()
-            a["FLAG"]="Single withdrawal ≥ MWK 1,000,000 — verify authorisation"
-            a=a.rename(columns={"DATE_FMT":"DATE","CREDIT":"AMOUNT"}); anoms.append(a)
-        dup_m=wd.duplicated(subset=["DATE_FMT","MEMBER_NAME","CREDIT"],keep=False)&(wd["MEMBER_NAME"]!="")&(wd["CREDIT"]>0)
-        dup_wd=wd[dup_m]
-        if not dup_wd.empty:
-            a=_pick(dup_wd,["LINE_NO","DATE_FMT","MEMBER_NAME","CREDIT"]).copy()
-            a["FLAG"]="Duplicate: same member + amount + date"; a=a.rename(columns={"DATE_FMT":"DATE","CREDIT":"AMOUNT"}); anoms.append(a)
-        if anoms: add(f"{lbl}_ANOMALIES",pd.concat(anoms,ignore_index=True),RED)
+            a["FLAG"]="Outside normal hours (before 07:00 / after 19:00)"; an.append(a)
+            F.add("LOW",tname,"Transactions outside normal hours",len(ah),"",
+                  f"{ti}_{lbl}_FLAGS","Confirm these were legitimate end/early-day entries")
+        if an:
+            cols=["LINE_NO","DATE_FMT","TIME_DISPLAY","CATEGORY","MEMBER_NAME","CREDIT","DEBIT","OFFICER","FLAG"]
+            flags=pd.concat([x.reindex(columns=[c for c in cols if c in x.columns or c=="FLAG"]) for x in an],ignore_index=True)
+            flags=flags.rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","CREDIT":"AMOUNT_OUT","DEBIT":"AMOUNT_IN"})
+            add(f"{ti}_{lbl}_FLAGS",flags,RED)
 
-    # TREASURY
+    # ===== TREASURY =====
     if treasury is not None and not treasury.empty:
-        TR=["LINE_NO","DATE_FMT","TIME_DISPLAY","CHEQUE_NO","BATCH_NO","ACTIVITY","DEBIT","CREDIT","BALANCE","REFERENCE"]
-        tcat=(treasury.groupby("CATEGORY").agg(ROWS=("DEBIT","count"),TOTAL_DEBIT=("DEBIT","sum"),TOTAL_CREDIT=("CREDIT","sum")).reset_index())
-        tcat["NET"]=tcat["TOTAL_DEBIT"]-tcat["TOTAL_CREDIT"]
-        add("TREASURY_SUMMARY",tcat,NAVY)
-        cfb=treasury[treasury["CATEGORY"]=="CASH_FROM_BANK"]
+        TR=["LINE_NO","DATE_FMT","TIME_DISPLAY","CHEQUE_NO","TELLER_NO","ACTIVITY",
+            "OFFICER","DEBIT","CREDIT","BALANCE_NUM","BALANCE","REFERENCE"]
+        TREN={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","BALANCE_NUM":"BALANCE_MWK"}
+        sd,sc=treasury["DEBIT"].sum(),treasury["CREDIT"].sum()
+        ok,cd,cc=_tie_out(treasury,sd,sc)
+        if ok is False:
+            F.add("HIGH","Treasury","Parsed totals do not tie to statement footer","",
+                  f"DR diff {sd-cd:,.0f} / CR diff {sc-cc:,.0f}","30_TREASURY_CATEGORY","Re-export; a row may be missing/duplicated")
+        nb,_=_bal_breaks(treasury)
+        if nb: F.add("HIGH","Treasury","Running balance does not reconcile line to line",nb,"","32_CHEQUE_SEQUENCE","Inspect ordering / missing rows")
+
+        cat=(treasury.groupby("CATEGORY").agg(ROW_COUNT=("DEBIT","count"),
+              TOTAL_DEBIT=("DEBIT","sum"),TOTAL_CREDIT=("CREDIT","sum")).reset_index())
+        cat["NET"]=cat["TOTAL_DEBIT"]-cat["TOTAL_CREDIT"]
+        add("30_TREASURY_CATEGORY",cat.sort_values("TOTAL_DEBIT",ascending=False),NAVY)
+
+        cfb=treasury[treasury["CATEGORY"]=="CASH_FROM_BANK"].copy()
         if not cfb.empty:
-            chq=cfb[["DATE_FMT","CHEQUE_NO","BATCH_NO","DEBIT","ACTIVITY","REFERENCE"]].copy()
-            chq.columns=["DATE","CHEQUE_NO","BATCH_NO","AMOUNT_DRAWN","DESCRIPTION","REFERENCE"]
-            chq=chq.sort_values("CHEQUE_NO"); chq["VERIFIED"]=""
-            add("CHEQUE_REGISTER",chq,GREEN)
-            nums=pd.to_numeric(chq["CHEQUE_NO"],errors="coerce").dropna().astype(int).sort_values()
+            cfb["CHEQUE_INT"]=pd.to_numeric(cfb["CHEQUE_NO"],errors="coerce")
+            reg=_pick(cfb.sort_values("CHEQUE_INT"),
+                      ["CHEQUE_NO","DATE_FMT","DEBIT","DEPOSITOR","OFFICER","BATCH_NO","REFERENCE"])
+            reg=reg.rename(columns={"DATE_FMT":"DATE_DRAWN","DEBIT":"AMOUNT_DRAWN"})
+            reg["VERIFIED_Y_N"]=""           # manual tick during physical recon
+            reg["CHEQUE_NO"]=pd.to_numeric(reg["CHEQUE_NO"],errors="coerce").astype("Int64")
+            add("31_CHEQUE_REGISTER",reg,GREEN)
+
+            nums=cfb["CHEQUE_INT"].dropna().astype(int).tolist()
             if len(nums)>1:
-                missing=sorted(set(range(nums.min(),nums.max()+1))-set(nums))
-                if missing:
-                    add("CHEQUE_GAPS",pd.DataFrame({"CHEQUE_NO":missing,"STATUS":"NOT IN SYSTEM DATA",
-                        "ACTION_REQUIRED":"Verify in physical cheque book — used, cancelled, or returned?"}),RED)
-        for cat,nm,col in [("CASH_FROM_BANK","CASH_FROM_BANK",GREEN),("CASH_TO_BANK","CASH_TO_BANK",BLUE),
-                            ("CASH_TO_TELLERS","CASH_TO_TELLERS",TEAL),("CASH_FROM_TELLERS","CASH_FROM_TELLERS",TEAL),
-                            ("PETTY_CASH_TOPUP","PETTY_TOPUP",PURPLE),("REVERSAL","TREASURY_REVERSALS",RED),
-                            ("CASH_DIFFERENCE","CASH_DIFFERENCES",AMBER),("OTHER","TREASURY_OTHER",NAVY)]:
-            sub=treasury[treasury["CATEGORY"]==cat]
+                uniq,dups,outl,(lo,hi),miss=_cheque_sequence(nums)
+                seq=[]
+                byno={}
+                for _,rr in cfb.dropna(subset=["CHEQUE_INT"]).iterrows():
+                    byno.setdefault(int(rr["CHEQUE_INT"]),(rr["DATE_FMT"],rr["DEBIT"]))
+                for n in range(lo,hi+1):
+                    if n in miss: seq.append([n,"*** MISSING ***","",""])
+                    elif n in dups: seq.append([n,f"DUPLICATE x{Counter(nums)[n]}",byno.get(n,('',''))[0],byno.get(n,('',0))[1]])
+                    elif n in byno: seq.append([n,"found",byno[n][0],byno[n][1]])
+                    else: seq.append([n,"*** MISSING ***","",""])
+                for n in outl:
+                    seq.append([n,"OUTLIER (review)",byno.get(n,('',''))[0],byno.get(n,('',0))[1]])
+                add("32_CHEQUE_SEQUENCE",pd.DataFrame(seq,
+                    columns=["CHEQUE_NO","STATUS","DATE_DRAWN","AMOUNT_DRAWN"]),GREEN)
+                if miss:
+                    F.add("HIGH","Treasury","Cheque numbers missing within the issued sequence",
+                          len(miss),"","32_CHEQUE_SEQUENCE",
+                          f"Verify against the physical cheque book: {miss[:25]}{'...' if len(miss)>25 else ''}")
+                if dups:
+                    F.add("HIGH","Treasury","Cheque numbers appearing more than once",
+                          len(dups),"","32_CHEQUE_SEQUENCE",
+                          f"Confirm not double-drawn: {dups[:25]}")
+                if outl:
+                    F.add("MEDIUM","Treasury","Isolated cheque number(s) far outside the sequence",
+                          len(outl),"","32_CHEQUE_SEQUENCE",f"Likely a different book or typo: {outl}")
+
+        for cat_,nm,col in [("CASH_FROM_BANK","33_CASH_FROM_BANK",GREEN),
+                            ("CASH_TO_BANK","34_CASH_TO_BANK",BLUE),
+                            ("CASH_TO_TELLERS","35_CASH_TO_TELLERS",TEAL),
+                            ("CASH_FROM_TELLERS","36_CASH_FROM_TELLERS",TEAL),
+                            ("PETTY_CASH_TOPUP","37_PETTY_TOPUP",PURPLE),
+                            ("CASH_DIFFERENCE","38_CASH_DIFFERENCES",AMBER),
+                            ("REVERSAL","39_TREASURY_REVERSALS",RED),
+                            ("OTHER","40_TREASURY_OTHER",NAVY)]:
+            sub=treasury[treasury["CATEGORY"]==cat_]
             if not sub.empty:
-                add(nm,_pick(sub,TR).rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME"}),col)
+                add(nm,_pick(sub.sort_values("LINE_NO"),TR).rename(columns=TREN),col)
+        rv=treasury[treasury["CATEGORY"]=="REVERSAL"]
+        if not rv.empty:
+            F.add("MEDIUM","Treasury","Reversals present",len(rv),rv["CREDIT"].sum(),
+                  "39_TREASURY_REVERSALS","Confirm each reversal has an approved original entry")
+        cdf=treasury[treasury["CATEGORY"]=="CASH_DIFFERENCE"]
+        if not cdf.empty:
+            F.add("HIGH","Treasury","Cash overage / shortage entries",len(cdf),
+                  (cdf["DEBIT"]+cdf["CREDIT"]).sum(),"38_CASH_DIFFERENCES","Investigate and document the cause of each difference")
 
-    # JOURNALS
+    # ===== JOURNALS =====
     if journals is not None and not journals.empty:
-        JC=["BATCH_NO","DATE_FMT","WEEKDAY","DESC_CLEAN","CATEGORY","CREATED_BY","APPROVED_BY","DR_NAME","CR_NAME","DEBIT","CREDIT"]
+        JC=["BATCH_NO","DATE_FMT","WEEKDAY","DESC_CLEAN","CATEGORY","CREATED_BY",
+            "APPROVED_BY","DR_NAME","CR_NAME","DEBIT","CREDIT"]
         def jout(df): return _pick(df,JC).rename(columns={"DATE_FMT":"DATE"})
-        add("JOURNALS_ALL",jout(journals.sort_values("DATE")),BLUE)
-        for cat,nm,col in [("CASH_FROM_BANK","J_CASH_FROM_BANK",GREEN),("CASH_TO_BANK","J_CASH_TO_BANK",TEAL),
-                            ("MARKETING_BAM","J_MARKETING_BAM",AMBER),("TRANSPORT","J_TRANSPORT",NAVY),
-                            ("PETTY_CASH","J_PETTY_CASH",PURPLE),("SAVINGS_TRANSFER","J_SAVINGS_TRANSFER",BLUE),
-                            ("MEMBER_EDUCATION","J_MEMBER_EDUCATION",TEAL),("INSURANCE","J_INSURANCE",NAVY),
-                            ("UTILITIES","J_UTILITIES",NAVY),("OFFICE_SUPPLIES","J_OFFICE_SUPPLIES",NAVY),
-                            ("FUEL_GENERATOR","J_FUEL_GENERATOR",AMBER)]:
-            sub=journals[journals["CATEGORY"]==cat]
-            if not sub.empty: add(nm,jout(sub.sort_values("DATE")),col)
-
+        add("50_JOURNALS_ALL",jout(journals.sort_values("DATE")),BLUE)
+        sm=int(journals["SAME_MAKER_CHECKER"].sum()); nc=int(journals["NO_CHECKER"].sum())
+        p2=int(journals["PERSON_TO_PERSON"].sum()); sp=int(journals["SAME_PERSON_DR_CR"].sum())
+        if sm: F.add("CRITICAL","Journals","Same person created and approved the journal (maker-checker failure)",sm,journals[journals['SAME_MAKER_CHECKER']]["DEBIT"].sum(),"51_JOURNALS_INVESTIGATE","Enforce segregation of duties; review each batch")
+        if nc: F.add("CRITICAL","Journals","Journals with no checker/approver recorded",nc,journals[journals['NO_CHECKER']]["DEBIT"].sum(),"51_JOURNALS_INVESTIGATE","Confirm authorisation; require an approver on all journals")
+        if p2: F.add("HIGH","Journals","Person-to-person transfers (neither side a system account)",p2,"","51_JOURNALS_INVESTIGATE","Verify legitimacy of each transfer")
+        if sp: F.add("HIGH","Journals","Same person on both debit and credit side",sp,"","51_JOURNALS_INVESTIGATE","Investigate for circular / suspicious entries")
         inv=[]
-        for df_sub,msg in [(journals[journals["SAME_MAKER_CHECKER"]==True],"SAME MAKER AND CHECKER — control failure"),
-                           (journals[journals["NO_CHECKER"]==True],"NO APPROVER RECORDED"),
-                           (journals[journals["PERSON_TO_PERSON"]==True],"PERSON-TO-PERSON TRANSFER — verify legitimacy"),
-                           (journals[journals["SAME_PERSON_DR_CR"]==True],"SAME PERSON DEBIT AND CREDIT — investigate"),
-                           (journals[journals["IS_WEEKEND"]==True].drop_duplicates("BATCH_NO"),"WEEKEND JOURNAL — verify physical authorisation")]:
-            for _,r in df_sub.iterrows():
-                d={c:r[c] for c in JC if c in r.index}; d["FINDING"]=msg; inv.append(d)
+        for sub,msg,sev in [
+            (journals[journals["SAME_MAKER_CHECKER"]==True],"Same maker and checker - control failure","CRITICAL"),
+            (journals[journals["NO_CHECKER"]==True],"No approver recorded","CRITICAL"),
+            (journals[journals["PERSON_TO_PERSON"]==True],"Person-to-person transfer - verify","HIGH"),
+            (journals[journals["SAME_PERSON_DR_CR"]==True],"Same person debit and credit - investigate","HIGH")]:
+            for _,r in sub.iterrows():
+                d={c:r[c] for c in JC if c in r.index}; d["SEVERITY"]=sev; d["FINDING"]=msg; inv.append(d)
         if inv:
-            idf=pd.DataFrame(inv)
-            if "DATE_FMT" in idf.columns: idf=idf.rename(columns={"DATE_FMT":"DATE"})
-            add("JOURNALS_INVESTIGATE",idf,RED)
+            idf=pd.DataFrame(inv).rename(columns={"DATE_FMT":"DATE"})
+            front=["SEVERITY","FINDING"]+[c for c in idf.columns if c not in ("SEVERITY","FINDING")]
+            add("51_JOURNALS_INVESTIGATE",idf[front],RED)
+        add("52_J_CREATORS",journals.groupby("CREATED_BY").agg(BATCHES=("BATCH_NO","nunique"),TOTAL_DEBIT=("DEBIT","sum")).reset_index().sort_values("TOTAL_DEBIT",ascending=False),NAVY)
+        ap=journals[journals["APPROVED_BY"].str.strip()!=""]
+        if not ap.empty:
+            add("53_J_APPROVERS",ap.groupby("APPROVED_BY").agg(APPROVED=("BATCH_NO","nunique")).reset_index().sort_values("APPROVED",ascending=False),NAVY)
 
-        add("J_CREATORS",journals.groupby("CREATED_BY").agg(BATCHES=("BATCH_NO","nunique"),TOTAL_DEBIT=("DEBIT","sum")).reset_index().sort_values("TOTAL_DEBIT",ascending=False),NAVY)
-        add("J_APPROVERS",journals[journals["APPROVED_BY"].str.strip()!=""].groupby("APPROVED_BY").agg(APPROVED=("BATCH_NO","nunique")).reset_index().sort_values("APPROVED",ascending=False),NAVY)
-
-    # PETTY
+    # ===== PETTY =====
     if petty is not None and not petty.empty:
-        pc=["LINE_NO","DATE_FMT","TIME_DISPLAY","BATCH_NO","CATEGORY","ACTIVITY","DEBIT","CREDIT","BALANCE","FLAG"]
-        reg=_pick(petty,pc).rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME"}); reg["VERIFIED"]=""
-        add("PETTY_REGISTER",reg,TEAL)
-        cs=(petty[petty["CREDIT"]>0].groupby("CATEGORY").agg(TRANSACTIONS=("CREDIT","count"),TOTAL_SPENT=("CREDIT","sum")).reset_index().sort_values("TOTAL_SPENT",ascending=False))
-        tot=cs["TOTAL_SPENT"].sum(); cs["PCT_OF_TOTAL"]=(cs["TOTAL_SPENT"]/tot*100).round(1)
-        add("PETTY_CATEGORY_SUMMARY",cs,NAVY)
-        dp2=(petty.groupby("DATE_FMT",sort=False).agg(DATE=("DATE","first"),TRANSACTIONS=("CREDIT","count"),TOTAL_SPENT=("CREDIT","sum")).reset_index(drop=True).sort_values("DATE"))
-        dp2["DATE"]=dp2["DATE"].apply(_fmt); dp2["VERIFIED"]=""
-        add("PETTY_DAILY_SUMMARY",dp2,NAVY)
-        ap=petty[petty["FLAG"]!=""][[c for c in ["LINE_NO","DATE_FMT","ACTIVITY","CREDIT","FLAG"] if c in petty.columns]].rename(columns={"DATE_FMT":"DATE","CREDIT":"AMOUNT"})
-        if not ap.empty: add("PETTY_ANOMALIES",ap,RED)
+        sd,sc=petty["DEBIT"].sum(),petty["CREDIT"].sum()
+        ok,cd,cc=_tie_out(petty,sd,sc)
+        if ok is False:
+            F.add("HIGH","Petty cash","Parsed totals do not tie to statement footer","",
+                  f"DR diff {sd-cd:,.0f} / CR diff {sc-cc:,.0f}","70_PETTY_REGISTER","Re-export; check for missing rows")
+        pc=["LINE_NO","DATE_FMT","TIME_DISPLAY","BATCH_NO","CATEGORY","ACTIVITY",
+            "OFFICER","DEBIT","CREDIT","BALANCE_NUM","FLAG"]
+        reg=_pick(petty.sort_values("LINE_NO"),pc).rename(columns={"DATE_FMT":"DATE","TIME_DISPLAY":"TIME","BALANCE_NUM":"BALANCE_MWK"})
+        reg["VERIFIED_Y_N"]=""
+        add("70_PETTY_REGISTER",reg,TEAL)
+        cs=(petty[petty["CREDIT"]>0].groupby("CATEGORY").agg(TRANSACTIONS=("CREDIT","count"),
+             TOTAL_SPENT=("CREDIT","sum")).reset_index().sort_values("TOTAL_SPENT",ascending=False))
+        if not cs.empty:
+            cs["PCT_OF_TOTAL"]=(cs["TOTAL_SPENT"]/cs["TOTAL_SPENT"].sum()*100).round(1)
+        add("71_PETTY_CATEGORY",cs,NAVY)
+        flagged=petty[petty["FLAG"]!=""]
+        if not flagged.empty:
+            a=_pick(flagged,["LINE_NO","DATE_FMT","CATEGORY","ACTIVITY","OFFICER","CREDIT","FLAG"]).rename(columns={"DATE_FMT":"DATE","CREDIT":"AMOUNT"})
+            add("72_PETTY_FLAGS",a,RED)
+            F.add("MEDIUM","Petty cash","Petty cash items flagged for review",len(flagged),
+                  flagged["CREDIT"].sum(),"72_PETTY_FLAGS","Match each flagged item to its voucher and receipt")
 
-    # write
+    # ===== OVERVIEW (built last so it can summarise everything) =====
+    ov=[("BRANCH SUPERVISION ANALYSIS",""),("Branch",branch or "Not specified"),
+        ("Period",f"{_fmt(p0)} to {_fmt(p1)}" if p0 is not None else "N/A"),
+        ("Generated",datetime.now().strftime("%d/%m/%Y %H:%M")),
+        ("Automated findings raised",len([i for i in F.items])),("","")]
+    if not all_till.empty:
+        wd=all_till[all_till["CATEGORY"]=="WITHDRAWAL"]; dp=all_till[all_till["CATEGORY"]=="DEPOSIT"]
+        dr=all_till[all_till["CATEGORY"]=="DIRECT_RECEIPT"]
+        tok,tcd,tcc=_tie_out(list(tills.values()),all_till["DEBIT"].sum(),all_till["CREDIT"].sum())
+        ov+=[("TILLS",""),("Number of tills",len(tills)),("Transactions (all tills)",len(all_till)),
+             ("Total withdrawals (MWK)",_money_str(wd["CREDIT"].sum())),("Withdrawal count",len(wd)),
+             ("Total deposits (MWK)",_money_str(dp["DEBIT"].sum())),
+             ("Total direct receipts (MWK)",_money_str(dr["DEBIT"].sum())),
+             ("Tills tie to statements?","Yes" if tok else ("No - investigate" if tok is False else "No footer found")),("","")]
+    if treasury is not None and not treasury.empty:
+        cfb=treasury[treasury["CATEGORY"]=="CASH_FROM_BANK"]; ctt=treasury[treasury["CATEGORY"]=="CASH_TO_TELLERS"]
+        ov+=[("TREASURY",""),("Cash received from bank (MWK)",_money_str(cfb["DEBIT"].sum())),
+             ("Cheque withdrawals",len(cfb)),("Cash issued to tellers (MWK)",_money_str(ctt["CREDIT"].sum())),("","")]
+    if journals is not None and not journals.empty:
+        ov+=[("JOURNALS",""),("Journal batches",journals["BATCH_NO"].nunique()),
+             ("Maker-checker failures",int(journals["SAME_MAKER_CHECKER"].sum())),
+             ("No approver recorded",int(journals["NO_CHECKER"].sum())),("","")]
+    if petty is not None and not petty.empty:
+        ov+=[("PETTY CASH",""),("Transactions",len(petty)),
+             ("Total expenditure (MWK)",_money_str(petty["CREDIT"].sum())),
+             ("Items flagged",int((petty["FLAG"]!="").sum()))]
+    sheets.insert(0,("01_OVERVIEW",_safe_df(pd.DataFrame(ov,columns=["Item","Value"])),NAVY))
+    sheets.insert(0,("00_FINDINGS",_safe_df(F.df()),RED))
+
+    # write + style
     with pd.ExcelWriter(buf,engine="openpyxl") as writer:
         for nm,df,_ in sheets: df.to_excel(writer,sheet_name=nm,index=False)
     buf.seek(0); wb=load_workbook(buf)
     for nm,_,col in sheets:
-        if nm in wb.sheetnames: _fmt_sheet(wb[nm],col)
+        if nm in wb.sheetnames: _style(wb[nm],col)
     out=io.BytesIO(); wb.save(out); out.seek(0); return out.read()
 
 # ── sidebar ────────────────────────────────────────────────────────────────────
